@@ -147,7 +147,7 @@ class KvcPromptCache:
         mx.clear_cache()  # return freed buffers to the OS
 
     def attach(self, timeout_ms=30000):
-        """Gather bytes from libKVC (promoting as needed) and rebuild mirrors."""
+        """Gather bytes from libKVC (any tier) and rebuild mx mirrors."""
         if not getattr(self, "detached", False):
             return
         self._sync()
@@ -159,13 +159,17 @@ class KvcPromptCache:
         if T == 0:
             self.detached = False
             return
-        arr = np.frombuffer(raw, dtype=np.float16).reshape(
-            T, self.n_layers, 2, -1, self._head_dim()
-        )  # (T, L, 2, H, D)
+        D = self._head_dim()
+        L = self.n_layers
+        # One host→device upload; per-layer transpose runs on Metal.
+        blob = mx.array(
+            np.frombuffer(raw, dtype=np.float16).reshape(T, L, 2, -1, D)
+        )
         for l, lc in enumerate(self.caches):
-            k = mx.array(np.ascontiguousarray(arr[:, l, 0].transpose(1, 0, 2)))[None]
-            v = mx.array(np.ascontiguousarray(arr[:, l, 1].transpose(1, 0, 2)))[None]
+            k = mx.contiguous(mx.transpose(blob[:, l, 0], (1, 0, 2)))[None]
+            v = mx.contiguous(mx.transpose(blob[:, l, 1], (1, 0, 2)))[None]
             lc._mirror.state = (k, v)  # KVCache.state setter restores offset
+        mx.eval(*[c._mirror.keys for c in self.caches])
         self.detached = False
         self.touch()  # restored working set is in-use for this turn
 
