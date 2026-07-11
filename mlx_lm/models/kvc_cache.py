@@ -92,6 +92,13 @@ class KvcPromptCache:
             )
         self.offset += n_new
         self._pending = [None] * self.n_layers
+        # Do NOT touch_sequence here: append already bumps last_access on the
+        # block being written. A full-sequence touch is O(n_blocks) per token
+        # and destroys decode throughput at long context. Callers that need
+        # step-boundary fencing should touch once per decode step/turn.
+
+    def touch(self):
+        """Bump last_access on every block (step/turn boundary fencing)."""
         self.manager.touch(self.seq)
 
     def _head_dim(self):
@@ -130,6 +137,7 @@ class KvcPromptCache:
             v = mx.array(np.ascontiguousarray(arr[:, l, 1].transpose(1, 0, 2)))[None]
             lc._mirror.state = (k, v)  # KVCache.state setter restores offset
         self.detached = False
+        self.touch()  # restored working set is in-use for this turn
 
     def free(self):
         self.manager.free(self.seq)
