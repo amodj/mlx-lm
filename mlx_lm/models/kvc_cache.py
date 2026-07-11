@@ -58,6 +58,7 @@ class KvcPromptCache:
         self.offset = 0  # tokens appended into libKVC
         self._h = None
         self._d = None
+        self.detached = False
         self.caches = [KvcLayerCache(self, i) for i in range(self.n_layers)]
 
     def on_layer_update(self, idx, keys, values):
@@ -92,6 +93,43 @@ class KvcPromptCache:
         self.offset += n_new
         self._pending = [None] * self.n_layers
         self.manager.touch(self.seq)
+
+    def _head_dim(self):
+        assert self._d is not None, "no tokens flushed yet; cannot attach empty cache"
+        return self._d
+
+    def detach(self):
+        """Drop mx mirrors; bytes remain solely in libKVC."""
+        if getattr(self, "detached", False):
+            return
+        assert all(p is None for p in self._pending)
+        for lc in self.caches:
+            lc._mirror.keys = None
+            lc._mirror.values = None
+            lc._mirror.offset = 0
+        self.detached = True
+        mx.clear_cache()  # return freed buffers to the OS
+
+    def attach(self, timeout_ms=30000):
+        """Gather bytes from libKVC (promoting as needed) and rebuild mirrors."""
+        if not getattr(self, "detached", False):
+            return
+        raw = self.manager.read(self.seq, timeout_ms=timeout_ms)  # valid prefix only
+        T = self.offset
+        assert len(raw) == T * self.bpt, (
+            f"read length {len(raw)} != offset*bpt {T * self.bpt}"
+        )
+        if T == 0:
+            self.detached = False
+            return
+        arr = np.frombuffer(raw, dtype=np.float16).reshape(
+            T, self.n_layers, 2, -1, self._head_dim()
+        )  # (T, L, 2, H, D)
+        for l, lc in enumerate(self.caches):
+            k = mx.array(np.ascontiguousarray(arr[:, l, 0].transpose(1, 0, 2)))[None]
+            v = mx.array(np.ascontiguousarray(arr[:, l, 1].transpose(1, 0, 2)))[None]
+            lc._mirror.state = (k, v)  # KVCache.state setter restores offset
+        self.detached = False
 
     def free(self):
         self.manager.free(self.seq)
