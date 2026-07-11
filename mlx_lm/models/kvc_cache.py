@@ -69,29 +69,26 @@ class KvcPromptCache:
             self._flush()
 
     def _flush(self):
-        ks = [p[0] for p in self._pending]
-        vs = [p[1] for p in self._pending]
-        mx.eval(*ks, *vs)  # force lazy arrays
-        n_new = ks[0].shape[2]
-        H, D = ks[0].shape[1], ks[0].shape[3]
+        # Pack on-device: one sync for the whole (T,L,2,H,D) record instead of
+        # 2L host round-trips + numpy stack/transpose. Then one ctypes-loop
+        # append (GIL released per kvc_append) — plan's accepted TpT remediation.
+        pending = self._pending
+        k = mx.stack([pending[i][0][0] for i in range(self.n_layers)])  # (L,H,T,D)
+        v = mx.stack([pending[i][1][0] for i in range(self.n_layers)])
+        k = mx.transpose(k, (2, 0, 1, 3))  # (T,L,H,D)
+        v = mx.transpose(v, (2, 0, 1, 3))
+        rec = mx.contiguous(mx.stack([k, v], axis=2))  # (T,L,2,H,D)
+        mx.eval(rec)
+        n_new = int(rec.shape[0])
+        H, D = int(rec.shape[3]), int(rec.shape[4])
         if self._h is None:
             self._h, self._d = H, D
-        # (L, H, T, D) -> token-major (T, L, 2, H, D), f16
-        k = np.stack([np.array(x[0], copy=False) for x in ks])  # drop batch
-        v = np.stack([np.array(x[0], copy=False) for x in vs])
-        rec = np.empty((n_new, self.n_layers, 2, H, D), dtype=np.float16)
-        rec[:, :, 0] = k.transpose(2, 0, 1, 3)
-        rec[:, :, 1] = v.transpose(2, 0, 1, 3)
-        raw = rec.tobytes()
-        assert len(raw) == n_new * self.bpt
-        for t in range(n_new):
-            self.manager.append(
-                self.seq,
-                raw[t * self.bpt : (t + 1) * self.bpt],
-                self.offset + t,
-            )
+        host = np.ascontiguousarray(rec, dtype=np.float16)
+        assert host.nbytes == n_new * self.bpt
+        self.manager.append_many(self.seq, host, self.offset)
         self.offset += n_new
-        self._pending = [None] * self.n_layers
+        for i in range(self.n_layers):
+            pending[i] = None
         # Do NOT touch_sequence here: append already bumps last_access on the
         # block being written. A full-sequence touch is O(n_blocks) per token
         # and destroys decode throughput at long context. Callers that need
