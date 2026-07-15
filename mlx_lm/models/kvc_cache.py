@@ -66,7 +66,11 @@ class KvcPromptCache:
         self._inflight_pos = 0
 
     def on_layer_update(self, idx, keys, values):
-        assert keys.dtype == mx.float16, "libKVC v1 requires f16 KV"
+        # libKVC storage is f16-only (KvDtype::F16). Mirror keeps the model
+        # dtype for attention; cast only the shadow copy before packing.
+        if keys.dtype != mx.float16:
+            keys = keys.astype(mx.float16)
+            values = values.astype(mx.float16)
         assert keys.shape[0] == 1, "libKVC v1 requires batch size 1"
         self._pending[idx] = (keys, values)
         if idx == self.n_layers - 1:
