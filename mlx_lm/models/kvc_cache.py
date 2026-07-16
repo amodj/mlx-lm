@@ -1,5 +1,8 @@
 # Copyright © 2023-2024 Apple Inc.
-# libKVC Stage A shadow cache — mirrors vanilla KVCache and shadows into libKVC.
+# libKVC Stage A' copy-on-park cache — vanilla mirrors during decode; KV is
+# copied into libKVC only at flush/park boundaries (no per-token shadow).
+
+import time
 
 import mlx.core as mx
 import numpy as np
@@ -7,8 +10,10 @@ from .cache import KVCache, _BaseCache
 
 
 class KvcLayerCache(_BaseCache):
-    """Per-layer cache handed to the model; mirrors vanilla KVCache and
-    reports every update to the KvcPromptCache coordinator."""
+    """Per-layer cache handed to the model; a plain vanilla KVCache mirror.
+
+    The mirror is the source of truth while attached. libKVC receives bytes
+    only when the coordinator flushes (park/commit boundaries)."""
 
     def __init__(self, coord, layer_idx):
         self._coord = coord
@@ -16,9 +21,7 @@ class KvcLayerCache(_BaseCache):
         self._mirror = KVCache()
 
     def update_and_fetch(self, keys, values):
-        out = self._mirror.update_and_fetch(keys, values)
-        self._coord.on_layer_update(self._idx, keys, values)
-        return out
+        return self._mirror.update_and_fetch(keys, values)
 
     @property
     def offset(self):
@@ -46,103 +49,101 @@ class KvcLayerCache(_BaseCache):
 
 
 class KvcPromptCache:
-    """Coordinator: owns one libKVC sequence; assembles token-major bytes
-    from per-layer updates and appends once per token."""
+    """Coordinator: owns one libKVC sequence; copies mirror KV into libKVC at
+    flush/park boundaries (copy-on-park), never per token."""
 
     def __init__(self, model, manager, prompt_tokens=None):
         self.n_layers = len(model.layers)
         self.manager = manager
         self.seq = manager.allocate(list(prompt_tokens or []))
         self.bpt = manager.kv_bytes_per_token
-        self._pending = [None] * self.n_layers
-        self.offset = 0  # tokens appended (or reserved) into libKVC
+        self.offset = 0  # tokens currently stored in libKVC
         self._h = None
         self._d = None
         self.detached = False
+        self.last_park_s = 0.0  # wall time of the most recent flush_to_kvc
         self.caches = [KvcLayerCache(self, i) for i in range(self.n_layers)]
-        # In-flight async pack: overlaps last-layer SDPA + lm_head.
-        self._inflight_rec = None
-        self._inflight_n = 0
-        self._inflight_pos = 0
 
-    def on_layer_update(self, idx, keys, values):
-        # libKVC storage is f16-only (KvDtype::F16). Mirror keeps the model
-        # dtype for attention; cast only the shadow copy before packing.
-        if keys.dtype != mx.float16:
-            keys = keys.astype(mx.float16)
-            values = values.astype(mx.float16)
-        assert keys.shape[0] == 1, "libKVC v1 requires batch size 1"
-        self._pending[idx] = (keys, values)
-        if idx == self.n_layers - 1:
-            # Schedule pack without blocking; commit lands before the next
-            # flush / detach / free. Hides host materialization behind the
-            # last-layer attention and lm_head that run after update_and_fetch.
-            self._flush_async()
+    # ------------------------------------------------------------------
+    # Copy-on-park
+    # ------------------------------------------------------------------
 
-    def _pack_pending(self):
-        """Build contiguous (T,L,2,H,D) f16 from pending layer updates."""
-        pending = self._pending
-        k = mx.stack([pending[i][0][0] for i in range(self.n_layers)])  # (L,H,T,D)
-        v = mx.stack([pending[i][1][0] for i in range(self.n_layers)])
-        k = mx.transpose(k, (2, 0, 1, 3))  # (T,L,H,D)
-        v = mx.transpose(v, (2, 0, 1, 3))
-        rec = mx.contiguous(mx.stack([k, v], axis=2))  # (T,L,2,H,D)
-        n_new = int(rec.shape[0])
-        H, D = int(rec.shape[3]), int(rec.shape[4])
+    def _mirror_offset(self):
+        offs = {int(lc._mirror.offset) for lc in self.caches}
+        assert len(offs) == 1, f"mirror offsets diverged: {sorted(offs)}"
+        return offs.pop()
+
+    def flush_to_kvc(self, chunk_tokens=2048):
+        """Copy mirror KV for tokens [self.offset, mirror_offset) into libKVC.
+
+        Chunked to bound transient memory. Returns the wall time spent.
+        No-op when libKVC is already up to date or the mirrors are empty.
+        """
+        assert not self.detached, "cannot flush while detached (mirrors are gone)"
+        t_start = time.perf_counter()
+        total = self._mirror_offset()
+        if total <= self.offset:
+            self.last_park_s = 0.0
+            return 0.0
+        mirrors = [lc._mirror for lc in self.caches]
         if self._h is None:
-            self._h, self._d = H, D
-        for i in range(self.n_layers):
-            pending[i] = None
-        return rec, n_new
+            k0 = mirrors[0].keys
+            self._h, self._d = int(k0.shape[1]), int(k0.shape[3])
+        for c0 in range(self.offset, total, int(chunk_tokens)):
+            c1 = min(c0 + int(chunk_tokens), total)
+            # Mirror keys/values are (1, H, T_alloc, D); slice the valid span.
+            ks = mx.stack([m.keys[0, :, c0:c1, :] for m in mirrors])  # (L,H,t,D)
+            vs = mx.stack([m.values[0, :, c0:c1, :] for m in mirrors])
+            # libKVC storage is f16-only (KvDtype::F16); cast bf16 shadows.
+            if ks.dtype != mx.float16:
+                ks = ks.astype(mx.float16)
+                vs = vs.astype(mx.float16)
+            k = mx.transpose(ks, (2, 0, 1, 3))  # (t,L,H,D)
+            v = mx.transpose(vs, (2, 0, 1, 3))
+            rec = mx.contiguous(mx.stack([k, v], axis=2))  # (t,L,2,H,D)
+            mx.eval(rec)
+            host = np.array(rec, dtype=np.float16, copy=False)
+            if not host.flags["C_CONTIGUOUS"] or not host.flags["WRITEABLE"]:
+                # append_many requires a writable C-contiguous buffer.
+                host = np.ascontiguousarray(host)
+                if not host.flags["WRITEABLE"]:
+                    host = host.copy()
+            assert host.nbytes == (c1 - c0) * self.bpt
+            self.manager.append_many(self.seq, host, c0)
+            self.offset = c1
+        self.last_park_s = time.perf_counter() - t_start
+        return self.last_park_s
 
-    def _commit_inflight(self):
-        """Sync any async pack and append into libKVC (ctypes loop, GIL released)."""
-        rec = self._inflight_rec
-        if rec is None:
-            return
-        host = np.array(rec, dtype=np.float16, copy=False)
-        if not host.flags["C_CONTIGUOUS"]:
-            host = np.ascontiguousarray(host)
-        n_new = self._inflight_n
-        assert host.nbytes == n_new * self.bpt
-        self.manager.append_many(self.seq, host, self._inflight_pos)
-        self._inflight_rec = None
-        self._inflight_n = 0
+    def commit_prompt(self, chunk_tokens=2048):
+        """Flush then publish the prompt prefix for radix sharing.
 
-    def _flush_async(self):
-        self._commit_inflight()
-        rec, n_new = self._pack_pending()
-        self._inflight_rec = rec
-        self._inflight_n = n_new
-        self._inflight_pos = self.offset
-        self.offset += n_new
-        mx.async_eval(rec)
-        # Do NOT touch_sequence here: append bumps last_access on the written
-        # block. Full-sequence touch is O(n_blocks)/token and kills decode TpT.
+        Call once right after prefill. Radix publishes full blocks only; a
+        partial tail block stays private — that is fine."""
+        self.flush_to_kvc(chunk_tokens=chunk_tokens)
+        self.manager.commit_prefix(self.seq)
 
-    def _sync(self):
-        """Drain async work; used by detach/attach/free/touch boundaries."""
-        self._commit_inflight()
-        if self._pending[self.n_layers - 1] is not None:
-            # Rare: forward aborted mid-step; finish synchronously.
-            self._flush_async()
-            self._commit_inflight()
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def touch(self):
         """Bump last_access on every block (step/turn boundary fencing)."""
-        self._sync()
-        self.manager.touch(self.seq)
+        if self.offset > 0:
+            self.manager.touch(self.seq)
 
     def _head_dim(self):
         assert self._d is not None, "no tokens flushed yet; cannot attach empty cache"
         return self._d
 
     def detach(self):
-        """Drop mx mirrors; bytes remain solely in libKVC."""
+        """Park: flush mirror KV into libKVC, then drop the mx mirrors."""
         if getattr(self, "detached", False):
             return
-        self._sync()
-        assert all(p is None for p in self._pending)
+        self.flush_to_kvc()
+        assert self.offset == self._mirror_offset(), (
+            f"park incomplete: libKVC offset {self.offset} != "
+            f"mirror offset {self._mirror_offset()}"
+        )
         for lc in self.caches:
             lc._mirror.keys = None
             lc._mirror.values = None
@@ -154,7 +155,6 @@ class KvcPromptCache:
         """Gather bytes from libKVC (any tier) and rebuild mx mirrors."""
         if not getattr(self, "detached", False):
             return
-        self._sync()
         raw = self.manager.read(self.seq, timeout_ms=timeout_ms)  # valid prefix only
         T = self.offset
         assert len(raw) == T * self.bpt, (
@@ -178,7 +178,6 @@ class KvcPromptCache:
         self.touch()  # restored working set is in-use for this turn
 
     def free(self):
-        self._sync()
         self.manager.free(self.seq)
 
 
