@@ -73,6 +73,14 @@ class KvcPromptCache:
 
         self.detached = False
         self.last_park_s = 0.0
+        # Attach phase breakdown (seconds); filled by _restore_mirrors_from_kvc.
+        self.last_attach_phases = {
+            "read_s": 0.0,
+            "upload_s": 0.0,
+            "transpose_s": 0.0,
+            "eval_s": 0.0,
+            "total_s": 0.0,
+        }
         self.caches = [KvcLayerCache(self, i) for i in range(self.n_layers)]
 
         reused = int(manager.seq_len(self.seq))
@@ -93,26 +101,58 @@ class KvcPromptCache:
     # ------------------------------------------------------------------
 
     def _restore_mirrors_from_kvc(self, timeout_ms=30000):
-        """Read self.offset tokens from libKVC and populate each layer mirror."""
+        """Read self.offset tokens from libKVC and populate each layer mirror.
+
+        Phase timings land in ``self.last_attach_phases``:
+        read_s (FFI), upload_s (np+mx.array), transpose_s (per-layer graph),
+        eval_s (mx.eval).
+        """
         T = self.offset
         assert T > 0, "_restore_mirrors_from_kvc called with offset 0"
         assert self._d is not None, (
             "head_dim unknown; pass n_kv_heads/head_dim to make_kvc_prompt_cache"
         )
+        t_all = time.perf_counter()
+        D = self._d
+        L = self.n_layers
+
+        t0 = time.perf_counter()
         raw = self.manager.read(self.seq, timeout_ms=timeout_ms)
+        read_s = time.perf_counter() - t0
         assert len(raw) == T * self.bpt, (
             f"read length {len(raw)} != offset*bpt {T * self.bpt}"
         )
-        D = self._d
-        L = self.n_layers
-        blob = mx.array(
-            np.frombuffer(raw, dtype=np.float16).reshape(T, L, 2, -1, D)
-        )
+
+        t0 = time.perf_counter()
+        host = np.frombuffer(raw, dtype=np.float16).reshape(T, L, 2, -1, D)
+        if self._h is None:
+            self._h = int(host.shape[3])
+        blob = mx.array(host)
+        mx.async_eval(blob)  # overlap host→device with transpose graph build
+        upload_s = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        # Per-layer transpose into (1,H,T,D). Skip mx.contiguous — MLX
+        # attention accepts the transposed view; avoiding the extra copy is
+        # worth ~eval time on attach.
         for l, lc in enumerate(self.caches):
-            k = mx.contiguous(mx.transpose(blob[:, l, 0], (1, 0, 2)))[None]
-            v = mx.contiguous(mx.transpose(blob[:, l, 1], (1, 0, 2)))[None]
+            k = mx.transpose(blob[:, l, 0], (1, 0, 2))[None]
+            v = mx.transpose(blob[:, l, 1], (1, 0, 2))[None]
             lc._mirror.state = (k, v)
+        transpose_s = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         mx.eval(*[c._mirror.keys for c in self.caches])
+        eval_s = time.perf_counter() - t0
+
+        total_s = time.perf_counter() - t_all
+        self.last_attach_phases = {
+            "read_s": read_s,
+            "upload_s": upload_s,
+            "transpose_s": transpose_s,
+            "eval_s": eval_s,
+            "total_s": total_s,
+        }
 
     # ------------------------------------------------------------------
     # Copy-on-park
